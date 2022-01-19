@@ -1,0 +1,318 @@
+/* BSD Socket API Example
+
+   This example code is in the Public Domain (or CC0 licensed, at your option.)
+
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/param.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "protocol_examples_common.h"
+
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include <lwip/netdb.h>
+
+#include "driver/twai.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+
+#define PORT CONFIG_EXAMPLE_PORT
+#define LEDC_HS_CH0_GPIO       (18)
+
+static const char *TAG = "debug";
+
+void getParams(char* );
+void ledcInit(void);
+
+/* Private define ------------------------------------------------------------*/
+static const twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_21, GPIO_NUM_22, TWAI_MODE_NORMAL);
+static const twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+static const twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+typedef enum{
+	
+	E46_CAN_RPM_ID	=		0x316,
+	E46_CAN_TEMP_ID	=		0x329,
+	E46_CAN_DSC_ID	=		0x153,
+	E46_CAN_DME4_ID	=		0x545,
+//		E46_CAN_FUEL_ID	=		0x613,
+//		E46_CAN_GB1_ID	=		0x43B,
+	E46_CAN_GB2_ID	=		0x43F,
+
+} e46CAN_ID_t;
+
+typedef struct{
+	
+	uint16_t speed;
+	uint32_t RPM;
+	uint8_t coolantTemp;
+	uint8_t fuel;
+	uint8_t gear;
+} ClusterValues_t;
+
+//to rpm get values to change
+float rpm = 2000;
+float rpmMax = 7000;
+float speed;
+
+ClusterValues_t ClusterValues;
+
+
+/* ---------------------------------------------------------*/
+static void udp_server_task(void *pvParameters)
+{
+    char rx_buffer[512];
+    char addr_str[128];
+    int addr_family = (int)pvParameters;
+    int ip_protocol = 0;
+    struct sockaddr_in6 dest_addr;
+
+    while (1) {
+
+        if (addr_family == AF_INET) {
+            struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
+            dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
+            dest_addr_ip4->sin_family = AF_INET;
+            dest_addr_ip4->sin_port = htons(PORT);
+            ip_protocol = IPPROTO_IP;
+        }
+
+        int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+            break;
+        }
+        ESP_LOGI(TAG, "Socket created");
+
+        int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err < 0) {
+            ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
+        }
+        ESP_LOGI(TAG, "Socket bound, port %d", PORT);
+
+        while (1) {
+
+            ESP_LOGI(TAG, "Waiting for data");
+            struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
+            socklen_t socklen = sizeof(source_addr);
+            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+
+            // Error occurred during receiving
+            if (len < 0) {
+                ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
+                break;
+            }
+            // Data received
+            else {
+                // Get the sender's ip address as string
+                if (source_addr.ss_family == PF_INET) {
+                    inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+                }
+
+                rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
+                ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
+                // ESP_LOGI(TAG, "%s", rx_buffer);
+				getParams(rx_buffer);
+				ClusterValues.speed = (uint16_t)speed;
+				ClusterValues.RPM = (uint32_t)rpm;
+				ESP_LOGI(TAG, "%3d\t%04d",  ClusterValues.speed, ClusterValues.RPM);
+				
+				float frq = ClusterValues.speed * 6.72f;
+				uint32_t fr = (uint32_t) frq;
+				
+				ledc_set_freq(LEDC_HIGH_SPEED_MODE, LEDC_TIMER_0, fr);
+
+				//loop-back sending
+                // int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+                // if (err < 0) {
+                    // ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+                    // break;
+                // }
+            }
+        }
+
+        if (sock != -1) {
+            ESP_LOGE(TAG, "Shutting down socket and restarting...");
+            shutdown(sock, 0);
+            close(sock);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+static void can_clusterSend_task(void *pvParameters)
+{
+	float tempRPM;
+	uint16_t tmp;
+	
+	twai_message_t data_message = {.identifier = E46_CAN_RPM_ID, .data_length_code = 8,
+                                     .data = {0, 0 , 0 , 0 ,0 ,0 ,0 ,0}};
+	
+	while (1) {
+		
+		tempRPM = (float)ClusterValues.RPM * 6.42f;
+		tmp = (uint16_t) tempRPM;
+		//dataRPM[1] = 0;
+		data_message.data[2] = (uint8_t) (tmp & 0xFF);
+		data_message.data[3] = (uint8_t) (tmp >> 8);
+		
+		
+		twai_transmit(&data_message, pdMS_TO_TICKS(1000));
+		
+		vTaskDelay(pdMS_TO_TICKS(50));
+	}
+}
+
+
+void app_main(void)
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
+     // * Read "Establishing Wi-Fi or Ethernet Connection" section in
+     // * examples/protocols/README.md for more information about this function.
+     // */
+    ESP_ERROR_CHECK(example_connect());
+	
+	 // Install TWAI driver, trigger tasks to start
+    ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
+    ESP_LOGI(TAG, "Driver installed");
+	ESP_ERROR_CHECK(twai_start());
+	ESP_LOGI(TAG, "Driver started");
+	
+	ledcInit();
+	
+	//ledc_set_freq();
+	
+    xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET, 5, NULL);
+	xTaskCreate(can_clusterSend_task, "can_clusterSend", 2048, NULL, 5, NULL);
+
+
+}
+
+void ledcInit(void)
+{
+	/*
+     * Prepare and set configuration of timers
+     * that will be used by LED Controller
+     */
+    ledc_timer_config_t ledc_timer = {
+        .duty_resolution = LEDC_TIMER_8_BIT, // resolution of PWM duty
+        .freq_hz = 538,                      // frequency of PWM signal
+        .speed_mode = LEDC_HIGH_SPEED_MODE,           // timer mode
+        .timer_num = LEDC_TIMER_0,            // timer index
+        .clk_cfg = LEDC_AUTO_CLK,              // Auto select the source clock
+    };
+	// Set configuration of timer0 for high speed channels
+    ledc_timer_config(&ledc_timer);
+	
+	ledc_channel_config_t ledc_channel = {
+            .channel    = LEDC_CHANNEL_0,
+            .duty       = 127,//127,
+            .gpio_num   = LEDC_HS_CH0_GPIO,
+            .speed_mode = LEDC_HIGH_SPEED_MODE,
+            .hpoint     = 0,
+            .timer_sel  = LEDC_TIMER_0
+    };
+	ledc_channel_config(&ledc_channel);
+	
+}
+
+void getParams(char* rcv_buffer)
+{
+	float sp;
+	bool isNaN;
+
+	//*********RPM MAX**********
+	// memcpy(&rpmMax, &rcv_buffer[8], 4);
+	// rpmMax -= 500;
+	// if (rpmMax < 0) rpmMax = 0;
+
+	//***********RPM************
+	// memcpy(&rpm, &rcv_buffer[16], 4);
+	memcpy(&rpm, &rcv_buffer[0], 4);
+
+	//*********SPEED*************
+	// memcpy(&sp, &rcv_buffer[40], 4);
+	memcpy(&sp, &rcv_buffer[4], 4);
+	// speed = sp * 3.6f;
+	speed = sp;
+	if (speed < 0) speed = -speed;
+
+	////***********YAW************
+	// memcpy(&yaw, &rcv_buffer[32], 4);
+	// if (yaw >= 0) {
+		// yaw = 1 + (yaw / 18);
+		// if (yaw > 2) yaw = 2;
+	// }
+	// else {
+		// yaw = 1 - (-yaw / 18);
+		// if (yaw < 0) yaw = 0;
+	// }
+
+	//***********GEAR************
+	// memcpy(&gear, &rcv_buffer[319], 1);
+
+	//switch (gear) {
+	//case 0:
+	//	gear = 7;
+	//	break;
+	//case 5:
+	//	gear = 9;
+	//	break;
+	//case 6:
+	//	gear = 10;
+	//	break;
+	//case 7:
+	//	gear = 5;
+	//	break;
+	//case 8:
+	//	gear = 5;
+	//	break;
+	//case 9:
+	//	gear = 5;
+	//	break;
+	//}
+
+	//assert for e46 speedo
+	rpm = (rpm / rpmMax) * 7200;
+	isNaN = (rpm != rpm);   //for a float f, f != f will be true only if f is NaN.
+	if (isNaN) rpm = 0;
+	if (speed > 255) speed = 255;
+
+	//test new parameters
+
+// 216 Car Class; //Between 0 (D -- worst cars) and 7 (X class -- best cars)
+// 220 CarPerformance Index np 800
+// 224 Drivetrain Type; 0 = FWD, 1 = RWD, 2 = AWD
+// 268 272 276 280 tire temps
+// 296 f32 BestLap;
+// 300 f32 LastLap;
+// 304 f32 CurrentLap;
+// 308 f32 CurrentRaceTime;
+// 312 u16 LapNumber; from 0
+// 314 u8 RacePosition;
+// 315 u8 Accel;
+// 316 u8 Brake;
+// 317 u8 Clutch;
+// 318 u8 HandBrake;
+// 319 u8 Gear;
+// 320 s8 Steer;
+
+}
