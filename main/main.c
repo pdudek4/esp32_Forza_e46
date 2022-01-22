@@ -1,19 +1,16 @@
-/* BSD Socket API Example
 
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_wpa2.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -135,6 +132,7 @@ static void udp_server_task(void *pvParameters)
 				uint32_t fr = (uint32_t) frq;
 				
 				ledc_set_freq(LEDC_HIGH_SPEED_MODE, LEDC_TIMER_0, fr);
+				ESP_LOGI("freq", "%d", fr); 
 
 				//loop-back sending
                 // int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
@@ -166,7 +164,6 @@ static void can_clusterSend_task(void *pvParameters)
 		
 		tempRPM = (float)ClusterValues.RPM * 6.42f;
 		tmp = (uint16_t) tempRPM;
-		//dataRPM[1] = 0;
 		data_message.data[2] = (uint8_t) (tmp & 0xFF);
 		data_message.data[3] = (uint8_t) (tmp >> 8);
 		
@@ -183,12 +180,8 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    // /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     // * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     // * examples/protocols/README.md for more information about this function.
-     // */
     ESP_ERROR_CHECK(example_connect());
+	
 	
 	 // Install TWAI driver, trigger tasks to start
     ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
@@ -197,8 +190,6 @@ void app_main(void)
 	ESP_LOGI(TAG, "Driver started");
 	
 	ledcInit();
-	
-	//ledc_set_freq();
 	
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET, 5, NULL);
 	xTaskCreate(can_clusterSend_task, "can_clusterSend", 2048, NULL, 5, NULL);
@@ -213,18 +204,18 @@ void ledcInit(void)
      * that will be used by LED Controller
      */
     ledc_timer_config_t ledc_timer = {
-        .duty_resolution = LEDC_TIMER_8_BIT, // resolution of PWM duty
-        .freq_hz = 538,                      // frequency of PWM signal
-        .speed_mode = LEDC_HIGH_SPEED_MODE,           // timer mode
-        .timer_num = LEDC_TIMER_0,            // timer index
-        .clk_cfg = LEDC_AUTO_CLK,              // Auto select the source clock
+        .duty_resolution = 5, // resolution of PWM duty
+        .freq_hz = 80,                      	// frequency of PWM signal
+        .speed_mode = LEDC_HIGH_SPEED_MODE,     // timer mode
+        .timer_num = LEDC_TIMER_0,            	// timer index
+        .clk_cfg = LEDC_AUTO_CLK,               // Auto select the source clock
     };
 	// Set configuration of timer0 for high speed channels
     ledc_timer_config(&ledc_timer);
 	
 	ledc_channel_config_t ledc_channel = {
             .channel    = LEDC_CHANNEL_0,
-            .duty       = 127,//127,
+            .duty       = 15,
             .gpio_num   = LEDC_HS_CH0_GPIO,
             .speed_mode = LEDC_HIGH_SPEED_MODE,
             .hpoint     = 0,
@@ -295,7 +286,7 @@ void getParams(char* rcv_buffer)
 	isNaN = (rpm != rpm);   //for a float f, f != f will be true only if f is NaN.
 	if (isNaN) rpm = 0;
 	if (speed > 255) speed = 255;
-
+	if (speed < 8) speed = 8;
 	//test new parameters
 
 // 216 Car Class; //Between 0 (D -- worst cars) and 7 (X class -- best cars)
