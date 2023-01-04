@@ -17,7 +17,6 @@
 #include "esp_wifi.h"
 #include "esp_wpa2.h"
 #include "esp_netif.h"
-// #include "protocol_examples_common.h"
 
 #include "esp_bt.h"
 #include "esp_blufi_api.h"
@@ -54,9 +53,8 @@ typedef enum{
 	E46_CAN_TEMP_ID	=		0x329,
 	E46_CAN_DSC_ID	=		0x153,
 	E46_CAN_DME4_ID	=		0x545,
-//		E46_CAN_FUEL_ID	=		0x613,
-//		E46_CAN_GB1_ID	=		0x43B,
 	E46_CAN_GB2_ID	=		0x43F,
+	E46_CAN_ABS_ID	=		0x1F0,
 
 } e46CAN_ID_t;
 
@@ -73,6 +71,8 @@ typedef struct{
 float rpm = 2000;
 float rpmMax = 7000;
 float speed;
+uint8_t gear;
+float yaw;
 
 ClusterValues_t ClusterValues;
 
@@ -448,7 +448,7 @@ static void udp_server_task(void *pvParameters)
 
         while (1) {
 
-            ESP_LOGI(TAG, "Waiting for data");
+            // ESP_LOGI(TAG, "Waiting for data");
             struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
             socklen_t socklen = sizeof(source_addr);
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
@@ -466,18 +466,20 @@ static void udp_server_task(void *pvParameters)
                 }
 
                 rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
-                ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
+                // ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
                 // ESP_LOGI(TAG, "%s", rx_buffer);
+				
 				getParams(rx_buffer);
+				
 				ClusterValues.speed = (uint16_t)speed;
 				ClusterValues.RPM = (uint32_t)rpm;
-				ESP_LOGI(TAG, "%3d\t%04d",  ClusterValues.speed, ClusterValues.RPM);
+				// ESP_LOGI(TAG, "%3d\t%04d",  ClusterValues.speed, ClusterValues.RPM);
 				
 				float frq = ClusterValues.speed * 6.72f;
 				uint32_t fr = (uint32_t) frq;
 				
 				ledc_set_freq(LEDC_HIGH_SPEED_MODE, LEDC_TIMER_0, fr);
-				ESP_LOGI("freq", "%d", fr); 
+				//ESP_LOGI("freq", "%d", fr); 
 
 				//loop-back sending
                 // int err = sendto(sock, rx_buffer, len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
@@ -497,21 +499,20 @@ static void udp_server_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-static void can_clusterSend_task(void *pvParameters)
+static void can_clusterSendRPM_task(void *pvParameters)
 {
 	float tempRPM;
 	uint16_t tmp;
 	
 	twai_message_t data_message = {.identifier = E46_CAN_RPM_ID, .data_length_code = 8,
-                                     .data = {0, 0 , 0 , 0 ,0 ,0 ,0 ,0}};
+                                     .data = {0x05, 0x62, 0 , 0 ,0x65, 0x12, 0, 62}};
 	
-	while (1) {
-		
+	while (1)
+	{	
 		tempRPM = (float)ClusterValues.RPM * 6.42f;
 		tmp = (uint16_t) tempRPM;
 		data_message.data[2] = (uint8_t) (tmp & 0xFF);
 		data_message.data[3] = (uint8_t) (tmp >> 8);
-		
 		
 		twai_transmit(&data_message, pdMS_TO_TICKS(1000));
 		
@@ -519,27 +520,116 @@ static void can_clusterSend_task(void *pvParameters)
 	}
 }
 
+static void can_clusterSendGear_task(void *pvParameters)
+{
+	twai_message_t data_gear = {.identifier = E46_CAN_GB2_ID, .data_length_code = 8,
+                                     .data = {8, 0 , 0x20 ,0 ,0 ,0 ,0 ,0}};
+	
+	while (1)
+	{
+		ClusterValues.gear = gear;
+		data_gear.data[1] = ClusterValues.gear;
+		twai_transmit(&data_gear, pdMS_TO_TICKS(1000));
+		// ESP_LOGI("gear", "%d", ClusterValues.gear); 
+
+		vTaskDelay(pdMS_TO_TICKS(200));
+	}
+}
+
+static void can_clusterSendYaw_task(void *pvParameters)
+{
+	twai_message_t data_message = {.identifier = E46_CAN_DME4_ID, .data_length_code = 8,
+                                     .data = {0, 0, 0, 0, 0, 0, 0, 0}};
+	float temp;
+	static uint16_t mpgValue;
+	
+	while (1)
+	{
+		temp = (float) ClusterValues.speed * 1.35f * yaw;
+		mpgValue += (uint16_t) temp;					//MPG rate of change
+		data_message.data[1] = (uint8_t) (mpgValue & 0xFF);
+		data_message.data[2] = (uint8_t) (mpgValue >> 8);
+				
+		twai_transmit(&data_message, pdMS_TO_TICKS(1000));
+
+		vTaskDelay(pdMS_TO_TICKS(50));
+	}
+}
+
+static void can_clusterSendCoolant_task(void *pvParameters)
+{
+	twai_message_t data_coolant = {.identifier = E46_CAN_TEMP_ID, .data_length_code = 8,
+                                     .data = {0, 0xA5 , 0 ,0 ,0 ,0x7D ,0 ,0}};
+	
+	while (1)
+	{			
+		// data_gear.data[1] = ClusterValues.colantTemp;
+		twai_transmit(&data_coolant, pdMS_TO_TICKS(1000));
+
+		vTaskDelay(pdMS_TO_TICKS(25));
+	}
+}
+
+static void can_clusterSendDSC_task(void *pvParameters)
+{
+	twai_message_t data_dsc = {.identifier = E46_CAN_DSC_ID, .data_length_code = 8,
+								 .data = {0, 0 , 0 ,0 ,0 ,0 ,0 ,0}};
+	
+	uint16_t tempSpeed;
+	while (1)
+	{
+		tempSpeed = ClusterValues.speed * 120;
+		data_dsc.data[1] = (uint8_t) (tempSpeed & 0xFF);
+		data_dsc.data[2] = (uint8_t) (tempSpeed >> 8);
+		
+		twai_transmit(&data_dsc, pdMS_TO_TICKS(1000));
+
+		vTaskDelay(pdMS_TO_TICKS(25));
+	}
+}
+
+static void can_clusterSendABS_task(void *pvParameters)
+{
+	twai_message_t data_abs = {.identifier = E46_CAN_ABS_ID, .data_length_code = 8};
+	
+	uint16_t tempSpeed;
+	while (1)
+	{
+		tempSpeed = ClusterValues.speed * 16;
+		data_abs.data[0] = (uint8_t) (tempSpeed & 0xFF);
+		data_abs.data[1] = (uint8_t) (tempSpeed >> 8);
+		data_abs.data[2] = data_abs.data[0];
+		data_abs.data[3] = data_abs.data[1];
+		data_abs.data[4] = data_abs.data[0];
+		data_abs.data[5] = data_abs.data[1];
+		data_abs.data[6] = data_abs.data[0];
+		data_abs.data[7] = data_abs.data[1];
+		
+		twai_transmit(&data_abs, pdMS_TO_TICKS(1000));
+
+		vTaskDelay(pdMS_TO_TICKS(50));
+	}
+}
 
 void app_main(void)
 {
-    // ESP_ERROR_CHECK(nvs_flash_init());
-    // ESP_ERROR_CHECK(esp_netif_init());
-    // ESP_ERROR_CHECK(esp_event_loop_create_default());
-    // ESP_ERROR_CHECK(example_connect());
 	blufiInit();
 	
 	 // Install TWAI driver, trigger tasks to start
     ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
-    ESP_LOGI(TAG, "Driver installed");
 	ESP_ERROR_CHECK(twai_start());
-	ESP_LOGI(TAG, "Driver started");
 	
 	ledcInit();
 	
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET, 5, NULL);
-	xTaskCreate(can_clusterSend_task, "can_clusterSend", 2048, NULL, 5, NULL);
-
-
+	vTaskDelay(3000 / portTICK_RATE_MS);
+	ClusterValues.gear = 6;
+	xTaskCreate(can_clusterSendRPM_task, "can_clusterSendR", 2048, NULL, 5, NULL);
+	xTaskCreate(can_clusterSendGear_task, "can_clusterSendG", 2048, NULL, 5, NULL);
+	xTaskCreate(can_clusterSendYaw_task, "can_clusterSendY", 2048, NULL, 5, NULL);
+	xTaskCreate(can_clusterSendCoolant_task, "can_clusterSendCool", 1024, NULL, 5, NULL);
+	xTaskCreate(can_clusterSendDSC_task, "can_clusterSendDSC", 1024, NULL, 5, NULL);
+	// xTaskCreate(can_clusterSendABS_task, "can_clusterSendABS", 1024, NULL, 5, NULL);
 }
 
 void ledcInit(void)
@@ -576,23 +666,23 @@ void getParams(char* rcv_buffer)
 	bool isNaN;
 
 	//*********RPM MAX**********
-	// memcpy(&rpmMax, &rcv_buffer[8], 4);
-	// rpmMax -= 500;
-	// if (rpmMax < 0) rpmMax = 0;
+	memcpy(&rpmMax, &rcv_buffer[8], 4);
+	rpmMax -= 500;
+	if (rpmMax < 0) rpmMax = 0;
 
 	//***********RPM************
-	// memcpy(&rpm, &rcv_buffer[16], 4);
-	memcpy(&rpm, &rcv_buffer[0], 4);
+	memcpy(&rpm, &rcv_buffer[16], 4);
+	// memcpy(&rpm, &rcv_buffer[0], 4);
 
 	//*********SPEED*************
-	// memcpy(&sp, &rcv_buffer[40], 4);
-	memcpy(&sp, &rcv_buffer[4], 4);
-	// speed = sp * 3.6f;
-	speed = sp;
+	memcpy(&sp, &rcv_buffer[40], 4);
+	// memcpy(&sp, &rcv_buffer[4], 4);
+	speed = sp * 3.6f;
+	//speed = sp;
 	if (speed < 0) speed = -speed;
 
 	//***********YAW************
-	/*memcpy(&yaw, &rcv_buffer[32], 4);
+	memcpy(&yaw, &rcv_buffer[32], 4);
 	if (yaw >= 0) {
 		yaw = 1 + (yaw / 18);
 		if (yaw > 2) yaw = 2;
@@ -600,10 +690,10 @@ void getParams(char* rcv_buffer)
 	else {
 		yaw = 1 - (-yaw / 18);
 		if (yaw < 0) yaw = 0;
-	}*/
+	}
 
 	//***********GEAR************
-	/*memcpy(&gear, &rcv_buffer[319], 1);
+	memcpy(&gear, &rcv_buffer[319], 1);
 
 	switch (gear) {
 	case 0:
@@ -624,8 +714,8 @@ void getParams(char* rcv_buffer)
 	case 9:
 		gear = 5;
 		break;
-	}*/
-
+	}
+// ESP_LOGI("yaw", "%f", yaw); 
 	//assert for e46 speedo
 	rpm = (rpm / rpmMax) * 7200;
 	isNaN = (rpm != rpm);   //for a float f, f != f will be true only if f is NaN.
